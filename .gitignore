@@ -168,3 +168,10 @@ platforms/android/.kotlin/
 **/discord_partner_sdk.aar
 **/discord_partner_sdk.jar
 platforms/android/app/src/main/cpp/3rdparty/discord/include/
+
+# graft's local graph cache — regenerable, not committed (run `graft build`).
+/graft/
+
+# Machine-local navigation metadata.
+/.serena/
+/.ignore
