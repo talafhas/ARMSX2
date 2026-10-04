@@ -8,8 +8,99 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 BUILD="$ROOT/build-m4"
 DEPS="$ROOT/deps"
 APP="/Applications/ARMSX2.app"
+# Fixed resource from the same official baseline, never the rolling patch feed.
+PATCH_RELEASE_URL="https://github.com/ARMSX2/ARMSX2/releases/download/nightly-20261003/ARMSX2-nightly-20261003-9d989ca933-macOS-arm64.tar.xz"
+PATCH_RELEASE_SHA256="2a418b721877a1e2268e2969d17e62d5a9d4b77d9355fcdcb27d39f51e9dc5e5"
+PATCH_MEMBER="ARMSX2-iOSv2.6.0.app/Contents/Resources/patches.zip"
+PATCH_SHA256="adaf38b455c276f7ff43f989fdb58ef130c4718d39ace977f275c8e911df97cc"
+PATCH_CACHE="$BUILD/resources/nightly-20261003"
+PATCH_FILE="$PATCH_CACHE/patches.zip"
 
 die() { echo "macos-dev: $*" >&2; exit 1; }
+
+prepare_patch_resource() {
+	/usr/bin/python3 - "$PATCH_CACHE" "${ARMSX2_PATCH_ARCHIVE:-}" "$PATCH_RELEASE_URL" \
+		"$PATCH_RELEASE_SHA256" "$PATCH_MEMBER" "$PATCH_SHA256" <<'PY'
+import hashlib
+from pathlib import Path
+import os
+import subprocess
+import sys
+import tarfile
+import tempfile
+import zipfile
+
+cache_arg, override, url, archive_sha, member_name, patch_sha = sys.argv[1:]
+cache = Path(cache_arg)
+cache.mkdir(parents=True, exist_ok=True)
+patch = cache / "patches.zip"
+
+def digest(path):
+    with path.open("rb") as source:
+        checksum = hashlib.sha256()
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            checksum.update(chunk)
+        return checksum.hexdigest()
+
+def validate_patch(path):
+    if not path.is_file() or path.is_symlink() or digest(path) != patch_sha:
+        raise RuntimeError("Pinned patches.zip SHA-256 mismatch: " + str(path))
+    with zipfile.ZipFile(path) as archive:
+        failed = archive.testzip()
+        if failed is not None:
+            raise RuntimeError("Patch ZIP CRC failure: " + failed)
+
+if patch.exists() or patch.is_symlink():
+    validate_patch(patch)
+    print("Verified cached October 3 patches: " + str(patch))
+    sys.exit(0)
+
+archive = Path(override).expanduser() if override else cache / "ARMSX2-nightly-20261003-9d989ca933-macOS-arm64.tar.xz"
+if not archive.exists():
+    if override:
+        raise RuntimeError("ARMSX2_PATCH_ARCHIVE does not exist: " + str(archive))
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(dir=cache, prefix=".release-", delete=False) as target:
+            temporary = Path(target.name)
+        subprocess.run(["/usr/bin/curl", "--fail", "--location", "--retry", "3",
+                        "--proto", "=https", "--proto-redir", "=https",
+                        "--output", str(temporary), url], check=True)
+        if digest(temporary) != archive_sha:
+            raise RuntimeError("Official October 3 release archive SHA-256 mismatch.")
+        os.replace(temporary, archive)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+if not archive.is_file() or digest(archive) != archive_sha:
+    raise RuntimeError("Official October 3 release archive SHA-256 mismatch: " + str(archive))
+
+temporary = None
+try:
+    with tarfile.open(archive, "r:xz") as release:
+        matches = [member for member in release.getmembers() if member.name == member_name]
+        if len(matches) != 1 or not matches[0].isfile() or matches[0].size != 2091144:
+            raise RuntimeError("Expected unique regular patch resource is missing or has changed.")
+        # Read this exact member only. Never extract archive paths to disk.
+        with release.extractfile(matches[0]) as source, tempfile.NamedTemporaryFile(
+                dir=cache, prefix=".patches-", delete=False) as target:
+            temporary = Path(target.name)
+            remaining = matches[0].size
+            while remaining:
+                chunk = source.read(min(1024 * 1024, remaining))
+                if not chunk:
+                    raise RuntimeError("Truncated patch archive member.")
+                target.write(chunk)
+                remaining -= len(chunk)
+    validate_patch(temporary)
+    temporary.chmod(0o644)
+    os.replace(temporary, patch)
+    print("Verified pinned October 3 patches: " + str(patch))
+finally:
+    if temporary is not None:
+        temporary.unlink(missing_ok=True)
+PY
+}
 
 check_stopped() {
 	local status=0
@@ -28,6 +119,8 @@ build_app() {
 	command -v cmake >/dev/null || die "cmake is required."
 	command -v ninja >/dev/null || die "ninja is required."
 	command -v ccache >/dev/null || die "ccache is required."
+	[ -x /usr/bin/python3 ] || die "Xcode's Python 3 is required to verify the pinned patch resource."
+	prepare_patch_resource
 	local jobs
 	jobs="$(getconf _NPROCESSORS_ONLN)"
 	if [ "$jobs" -gt 4 ]; then jobs=4; fi
@@ -52,6 +145,31 @@ build_app() {
 	cmake --build "$BUILD" --target pcsx2-qt --parallel "$jobs"
 	[ -x "$BUILD/pcsx2-qt/ARMSX2.app/Contents/MacOS/ARMSX2" ] ||
 		die "Build did not produce the expected ARMSX2.app bundle."
+	# Qt's local bundle copy does not receive CI's separately downloaded patches.
+	# Replace a stale resource atomically; do not write into tracked bin/resources.
+	/usr/bin/python3 - "$PATCH_FILE" "$BUILD/pcsx2-qt/ARMSX2.app/Contents/Resources" <<'PY'
+from pathlib import Path
+import os
+import shutil
+import sys
+import tempfile
+
+source, resources = map(Path, sys.argv[1:])
+resources.mkdir(parents=True, exist_ok=True)
+if not resources.resolve().is_relative_to(resources.parent.parent.resolve()):
+    raise RuntimeError("Build resource directory escapes its app bundle.")
+temporary = None
+try:
+    with tempfile.NamedTemporaryFile(dir=resources, prefix=".patches-", delete=False) as target:
+        temporary = Path(target.name)
+        with source.open("rb") as data:
+            shutil.copyfileobj(data, target)
+    temporary.chmod(0o644)
+    os.replace(temporary, resources / "patches.zip")
+finally:
+    if temporary is not None:
+        temporary.unlink(missing_ok=True)
+PY
 }
 
 install_app() {
@@ -62,8 +180,9 @@ install_app() {
 	build_app
 	# renamex_np(RENAME_SWAP) exchanges two bundle directories atomically on macOS.
 	# No old-app deletion precedes deployment, signing, or the atomic exchange.
-	/usr/bin/python3 - "$ROOT" "$BUILD" "$DEPS" "$APP" <<'PY'
+	/usr/bin/python3 - "$ROOT" "$BUILD" "$DEPS" "$APP" "$PATCH_FILE" "$PATCH_SHA256" <<'PY'
 import ctypes
+import hashlib
 import os
 from pathlib import Path
 import re
@@ -72,8 +191,10 @@ import subprocess
 import sys
 import tempfile
 import time
+import zipfile
 
-root, build, deps, installed = map(Path, sys.argv[1:])
+root, build, deps, installed, patch_source = map(Path, sys.argv[1:6])
+patch_sha = sys.argv[6]
 source = build / "pcsx2-qt/ARMSX2.app"
 lock = installed.parent / ".ARMSX2-dev-install.lock"
 stage_dir = None
@@ -145,6 +266,14 @@ def normalize_development_load_paths(bundle):
 
 def verify_bundle(bundle):
     bundle_root = bundle.resolve()
+    patches = bundle / "Contents/Resources/patches.zip"
+    if (not patches.is_file() or patches.is_symlink() or
+            not patches.resolve().is_relative_to(bundle_root) or
+            hashlib.sha256(patches.read_bytes()).hexdigest() != patch_sha):
+        raise RuntimeError("Bundle is missing the verified October 3 patches.zip resource.")
+    with zipfile.ZipFile(patches) as archive:
+        if archive.testzip() is not None:
+            raise RuntimeError("Bundled patches.zip failed ZIP CRC validation.")
     executable = bundle / "Contents/MacOS/ARMSX2"
     if not executable.is_file():
         raise RuntimeError("Bundle executable is missing.")
@@ -238,6 +367,10 @@ try:
     call("/usr/bin/ditto", source, staged)
     call(deps / "bin/macdeployqt", staged, "-no-strip")
     normalize_development_load_paths(staged)
+    patch_target = staged / "Contents/Resources/patches.zip"
+    if patch_target.is_symlink() or not patch_target.parent.resolve().is_relative_to(staged.resolve()):
+        raise RuntimeError("Refusing to stage patches through a bundle symlink.")
+    shutil.copyfile(patch_source, patch_target)
     call("/usr/bin/codesign", "--force", "--deep", "--sign", "-", staged)
     verify_bundle(staged)
     stopped()

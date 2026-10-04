@@ -8,6 +8,7 @@
 #include "GS.h"
 #include "GS/GSPerfMon.h"
 #include "GS/Renderers/Common/GSDevice.h"
+#include "GS/Renderers/Common/GSRenderer.h"
 #include "MTGS.h"
 #include "PerformanceMetrics.h"
 #include "SaveState.h"
@@ -358,6 +359,8 @@ namespace PINEServer
 		// (Mesa Turnip vs Qualcomm proprietary) that behave oppositely for fbfetch and
 		// push descriptors, so the driver string matters more than the device name.
 		std::string device_name, driver_info;
+		std::string active_renderer = "unknown";
+		int internal_width = 0, internal_height = 0;
 		if (MTGS::IsOpen())
 		{
 			// The MTGS ring is single-producer: m_WritePos is owned by the EE/CPU
@@ -369,9 +372,32 @@ namespace PINEServer
 			// no work). Marshal onto the CPU thread first -- the legitimate producer --
 			// and block until the GS-owned sample has been gathered.
 			Host::RunOnCPUThread(
-				[&gs_memory, &device_name, &driver_info]() {
-					MTGS::RunOnGSThread([&gs_memory, &device_name, &driver_info]() {
+				[&gs_memory, &device_name, &driver_info, &active_renderer, &internal_width, &internal_height]() {
+					MTGS::RunOnGSThread([&gs_memory, &device_name, &driver_info, &active_renderer, &internal_width, &internal_height]() {
 						GSgetMemoryStats(gs_memory);
+						if (g_gs_renderer)
+						{
+							// F9 can switch HW/SW without replacing the host device.
+							// Capture renderer state and dimensions on their owning thread.
+							GSRendererType renderer = GSGetCurrentRenderer();
+							if (renderer == GSRendererType::Auto && g_gs_device)
+							{
+								// Returning from SW can retain Auto as the HW renderer state.
+								// Resolve it from the actual device API, not the device name.
+								switch (g_gs_device->GetRenderAPI())
+								{
+									case RenderAPI::D3D11: renderer = GSRendererType::DX11; break;
+									case RenderAPI::D3D12: renderer = GSRendererType::DX12; break;
+									case RenderAPI::Metal: renderer = GSRendererType::Metal; break;
+									case RenderAPI::Vulkan: renderer = GSRendererType::VK; break;
+									case RenderAPI::OpenGL: renderer = GSRendererType::OGL; break;
+									default: break; // No hardware API: leave the sample unknown.
+								}
+							}
+							if (renderer != GSRendererType::Auto)
+								active_renderer = Pcsx2Config::GSOptions::GetRendererName(renderer);
+							GSgetInternalResolution(&internal_width, &internal_height);
+						}
 						if (g_gs_device)
 						{
 							device_name = g_gs_device->GetName();
@@ -415,7 +441,8 @@ namespace PINEServer
 			"\"tc_target_hit\":{:.1f},\"tc_target_miss\":{:.1f},"
 			"\"hash_cache_hit\":{:.1f},\"hash_cache_miss\":{:.1f},"
 			"\"gs_memory\":\"{}\",\"frame_number\":{},\"gs_front_parser\":{},"
-			"\"renderer\":\"{}\",\"device_name\":\"{}\",\"driver_info\":\"{}\""
+			"\"renderer\":\"{}\",\"active_renderer\":\"{}\",\"internal_width\":{},\"internal_height\":{},"
+			"\"device_name\":\"{}\",\"driver_info\":\"{}\""
 			"}}",
 			PerformanceMetrics::GetFPS(), PerformanceMetrics::GetInternalFPS(), PerformanceMetrics::GetSpeed(),
 			PerformanceMetrics::GetAverageFrameTime(), PerformanceMetrics::GetMinimumFrameTime(),
@@ -440,7 +467,8 @@ namespace PINEServer
 			// alone does not tell you -- it downgrades to lockstep on an unsupported config.
 			// True is also what makes gs_back_thread_* worth reading next to gs_thread_*.
 			gs_memory.view(), PerformanceMetrics::GetFrameNumber(), GSHasFrontParser() ? "true" : "false",
-			Pcsx2Config::GSOptions::GetRendererName(EmuConfig.GS.Renderer), device_name, driver_info);
+			Pcsx2Config::GSOptions::GetRendererName(EmuConfig.GS.Renderer), active_renderer, internal_width, internal_height,
+			device_name, driver_info);
 	}
 
 	/**

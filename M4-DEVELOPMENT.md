@@ -98,3 +98,46 @@ configuration outside tracked source. Preserve the upstream GPL license and
 notices. Keep the official October 3 reference bundle recoverable locally,
 alongside the helper's previous-app recovery copy, so baseline comparisons can
 restore the intended app version.
+
+## Pinned built-in patch resource
+
+Official macOS CI separately downloads `patches.zip` before packaging. A local
+Qt build does not obtain that file automatically. Without it, the emulator
+reports that built-in game patches are unavailable. The local helper now stages
+the exact patch resource packaged in the official October 3 ARM64 release,
+rather than downloading a rolling latest-patches archive.
+
+The resource identities are fixed in `tools/macos-dev.sh`:
+
+- Release URL: `https://github.com/ARMSX2/ARMSX2/releases/download/nightly-20261003/ARMSX2-nightly-20261003-9d989ca933-macOS-arm64.tar.xz`
+- Release archive SHA-256: `2a418b721877a1e2268e2969d17e62d5a9d4b77d9355fcdcb27d39f51e9dc5e5`
+- Exact regular tar member: `ARMSX2-iOSv2.6.0.app/Contents/Resources/patches.zip`
+- Patch ZIP SHA-256: `adaf38b455c276f7ff43f989fdb58ef130c4718d39ace977f275c8e911df97cc`
+- Patch ZIP size: 2,091,144 bytes; the verified reference contains 4,539 ZIP members.
+
+`build` verifies the cached ZIP hash and all member CRCs in ignored
+`build-m4/resources/nightly-20261003/`. If the ZIP is absent, it validates the
+pinned release archive and reads only the exact member with Python
+`tarfile.extractfile`; it never extracts release-bundle paths to disk. The
+release archive is downloaded into that cache only if no local archive was
+supplied and no cached archive exists. Corrupt cached inputs stop the operation
+instead of being silently replaced; inspect/remove them before retrying.
+
+To reuse an already downloaded official archive without another download:
+
+```sh
+ARMSX2_PATCH_ARCHIVE="/path/to/ARMSX2-nightly-20261003-macOS-arm64.tar.xz" \
+  tools/macos-dev.sh build
+```
+
+The optional path can have any filename; its full archive hash must match the
+pinned identity. It is used only when the verified ZIP is not already cached.
+The same environment variable works with `install`, which builds first.
+
+The helper copies the resource into the local build bundle, then explicitly into
+the installation staging bundle before signing. Bundle verification requires the
+pinned ZIP hash and valid CRCs both before atomic replacement and after
+installation. Tracked `bin/resources`, runtime settings, BIOS, games and saves
+are untouched. The reference archive/member/hash and CRCs were checked read-only
+on October 4; packaging validation and a new runtime check remain necessary after
+the next build/install.
