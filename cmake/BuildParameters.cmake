@@ -475,7 +475,8 @@ if(NOT CMAKE_GENERATOR MATCHES "Xcode")
 	# target older than the SDK calls it uses, which is a warning per object
 	# file and a real availability error on anything introduced since. So the
 	# embedded platforms keep whatever they were configured with.
-	if(NOT APPLE_EMBEDDED)
+	if(NOT APPLE_EMBEDDED AND
+		(NOT DEFINED CMAKE_OSX_DEPLOYMENT_TARGET OR CMAKE_OSX_DEPLOYMENT_TARGET STREQUAL ""))
 		set(CMAKE_OSX_DEPLOYMENT_TARGET 11.0)
 	endif()
 endif()
